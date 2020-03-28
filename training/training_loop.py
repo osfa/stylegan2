@@ -19,13 +19,16 @@ from metrics import metric_base
 #----------------------------------------------------------------------------
 # Just-in-time processing of training images before feeding them to the networks.
 
-def process_reals(x, labels, lod, mirror_augment, drange_data, drange_net):
+def process_reals(x, labels, lod, mirror_augment, mirror_augment_v, drange_data, drange_net):
     with tf.name_scope('DynamicRange'):
         x = tf.cast(x, tf.float32)
         x = misc.adjust_dynamic_range(x, drange_data, drange_net)
     if mirror_augment:
         with tf.name_scope('MirrorAugment'):
             x = tf.where(tf.random_uniform([tf.shape(x)[0]]) < 0.5, x, tf.reverse(x, [3]))
+    if mirror_augment_v:
+        with tf.name_scope('MirrorAugment_V'):
+            x = tf.where(tf.random_uniform([tf.shape(x)[0]]) < 0.5, x, tf.reverse(x, [2]))
     with tf.name_scope('FadeLOD'): # Smooth crossfade between consecutive levels-of-detail.
         s = tf.shape(x)
         y = tf.reshape(x, [-1, s[1], s[2]//2, 2, s[3]//2, 2])
@@ -81,22 +84,27 @@ def training_schedule(
         if lod_transition_kimg > 0:
             s.lod -= max(phase_kimg - lod_training_kimg, 0.0) / lod_transition_kimg
         s.lod = max(s.lod, 0.0)
-    s.resolution = 2 ** (training_set.resolution_log2 - int(np.floor(s.lod)))
+    #s.resolution = 2 ** (training_set.resolution_log2 - int(np.floor(s.lod)))
 
     # Minibatch size.
-    s.minibatch_size = minibatch_size_dict.get(s.resolution, minibatch_size_base)
-    s.minibatch_gpu = minibatch_gpu_dict.get(s.resolution, minibatch_gpu_base)
+    #s.minibatch_size = minibatch_size_dict.get(s.resolution, minibatch_size_base)
+    #s.minibatch_gpu = minibatch_gpu_dict.get(s.resolution, minibatch_gpu_base)
 
+    s.minibatch_size = minibatch_size_base
+    s.minibatch_gpu = minibatch_gpu_base
     # Learning rate.
-    s.G_lrate = G_lrate_dict.get(s.resolution, G_lrate_base)
-    s.D_lrate = D_lrate_dict.get(s.resolution, D_lrate_base)
+    # Removed dict reading, no progressive training support here
+    #s.G_lrate = G_lrate_dict.get(s.resolution, G_lrate_base)
+    #s.D_lrate = D_lrate_dict.get(s.resolution, D_lrate_base)
+    s.G_lrate = G_lrate_base
+    s.D_lrate = D_lrate_base
     if lrate_rampup_kimg > 0:
         rampup = min(s.kimg / lrate_rampup_kimg, 1.0)
         s.G_lrate *= rampup
         s.D_lrate *= rampup
 
     # Other parameters.
-    s.tick_kimg = tick_kimg_dict.get(s.resolution, tick_kimg_base)
+    s.tick_kimg = 6 #tick_kimg_dict.get(s.resolution, tick_kimg_base)
     return s
 
 #----------------------------------------------------------------------------
@@ -123,12 +131,13 @@ def training_loop(
     reset_opt_for_new_lod   = True,     # Reset optimizer internal state (e.g. Adam moments) when new layers are introduced?
     total_kimg              = 25000,    # Total length of the training, measured in thousands of real images.
     mirror_augment          = False,    # Enable mirror augment?
+    mirror_augment_v        = False,    # Enable mirror augment vertically?
     drange_net              = [-1,1],   # Dynamic range used when feeding image data to the networks.
     image_snapshot_ticks    = 1,       # How often to save image snapshots? None = only save 'reals.png' and 'fakes-init.png'.
     network_snapshot_ticks  = 1,       # How often to save network snapshots? None = only save 'networks-final.pkl'.
     save_tf_graph           = False,    # Include full TensorFlow computation graph in the tfevents file?
     save_weight_histograms  = False,    # Include weight histograms in the tfevents file?
-    resume_pkl              = None,     # Network pickle to resume training from, None = train from scratch.
+    resume_pkl              = 'latest',     # Network pickle to resume training from, None = train from scratch.
     resume_kimg             = 0.0,      # Assumed training progress at the beginning. Affects reporting and training schedule.
     resume_time             = 0.0,      # Assumed wallclock time at the beginning. Affects reporting.
     resume_with_new_nets    = False):   # Construct new networks according to G_args and D_args before resuming training?
@@ -140,16 +149,18 @@ def training_loop(
     # Load training set.
     training_set = dataset.load_dataset(data_dir=dnnlib.convert_path(data_dir), verbose=True, **dataset_args)
     grid_size, grid_reals, grid_labels = misc.setup_snapshot_image_grid(training_set, **grid_args)
-    misc.save_image_grid(grid_reals, dnnlib.make_run_dir_path('reals.png'), drange=training_set.dynamic_range, grid_size=grid_size)
+    misc.save_image_grid(grid_reals, dnnlib.make_run_dir_path('reals.jpg'), drange=training_set.dynamic_range, grid_size=grid_size)
 
     # Construct or load networks.
     with tf.device('/gpu:0'):
+        if resume_pkl == 'latest':
+           resume_pkl, resume_kimg = misc.locate_latest_pkl(dnnlib.submit_config.run_dir_root) 
         if resume_pkl is None or resume_with_new_nets:
             print('Constructing networks...')
             G = tflib.Network('G', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size, **G_args)
             D = tflib.Network('D', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size, **D_args)
             Gs = G.clone('Gs')
-        if resume_pkl is not None:
+        if resume_pkl is not None: 
             print('Loading networks from "%s"...' % resume_pkl)
             rG, rD, rGs = misc.load_pkl(resume_pkl)
             if resume_with_new_nets: G.copy_vars_from(rG); D.copy_vars_from(rD); Gs.copy_vars_from(rGs)
@@ -160,7 +171,7 @@ def training_loop(
     sched = training_schedule(cur_nimg=total_kimg*1000, training_set=training_set, **sched_args)
     grid_latents = np.random.randn(np.prod(grid_size), *G.input_shape[1:])
     grid_fakes = Gs.run(grid_latents, grid_labels, is_validation=True, minibatch_size=sched.minibatch_gpu)
-    misc.save_image_grid(grid_fakes, dnnlib.make_run_dir_path('fakes_init.png'), drange=drange_net, grid_size=grid_size)
+    misc.save_image_grid(grid_fakes, dnnlib.make_run_dir_path('fakes_init.jpg'), drange=drange_net, grid_size=grid_size)
 
     # Setup training inputs.
     print('Building TensorFlow graph...')
@@ -203,7 +214,7 @@ def training_loop(
                 reals_var = tf.Variable(name='reals', trainable=False, initial_value=tf.zeros([sched.minibatch_gpu] + training_set.shape))
                 labels_var = tf.Variable(name='labels', trainable=False, initial_value=tf.zeros([sched.minibatch_gpu, training_set.label_size]))
                 reals_write, labels_write = training_set.get_minibatch_tf()
-                reals_write, labels_write = process_reals(reals_write, labels_write, lod_in, mirror_augment, training_set.dynamic_range, drange_net)
+                reals_write, labels_write = process_reals(reals_write, labels_write, lod_in, mirror_augment, mirror_augment_v, training_set.dynamic_range, drange_net)
                 reals_write = tf.concat([reals_write, reals_var[minibatch_gpu_in:]], axis=0)
                 labels_write = tf.concat([labels_write, labels_var[minibatch_gpu_in:]], axis=0)
                 data_fetch_ops += [tf.assign(reals_var, reals_write)]
@@ -276,7 +287,9 @@ def training_loop(
         prev_lod = sched.lod
 
         # Run training ops.
-        feed_dict = {lod_in: sched.lod, lrate_in: sched.G_lrate, minibatch_size_in: sched.minibatch_size, minibatch_gpu_in: sched.minibatch_gpu}
+        # Seperate to two feed_dict, G/D rate matters for G/D train and reg optimizers, not for data_fetch_op and Gs_update_op
+        feed_dict_g = {lod_in: sched.lod, lrate_in: sched.G_lrate, minibatch_size_in: sched.minibatch_size, minibatch_gpu_in: sched.minibatch_gpu}
+        feed_dict_d = {lod_in: sched.lod, lrate_in: sched.D_lrate, minibatch_size_in: sched.minibatch_size, minibatch_gpu_in: sched.minibatch_gpu}
         for _repeat in range(minibatch_repeats):
             rounds = range(0, sched.minibatch_size, sched.minibatch_gpu * num_gpus)
             run_G_reg = (lazy_regularization and running_mb_counter % G_reg_interval == 0)
@@ -286,27 +299,27 @@ def training_loop(
 
             # Fast path without gradient accumulation.
             if len(rounds) == 1:
-                tflib.run([G_train_op, data_fetch_op], feed_dict)
+                tflib.run([G_train_op, data_fetch_op], feed_dict_g)
                 if run_G_reg:
-                    tflib.run(G_reg_op, feed_dict)
-                tflib.run([D_train_op, Gs_update_op], feed_dict)
+                    tflib.run(G_reg_op, feed_dict_g)
+                tflib.run([D_train_op, Gs_update_op], feed_dict_d)
                 if run_D_reg:
-                    tflib.run(D_reg_op, feed_dict)
+                    tflib.run(D_reg_op, feed_dict_d)
 
             # Slow path with gradient accumulation.
             else:
                 for _round in rounds:
-                    tflib.run(G_train_op, feed_dict)
+                    tflib.run(G_train_op, feed_dict_g)
                 if run_G_reg:
                     for _round in rounds:
-                        tflib.run(G_reg_op, feed_dict)
-                tflib.run(Gs_update_op, feed_dict)
+                        tflib.run(G_reg_op, feed_dict_g)
+                tflib.run(Gs_update_op, feed_dict_g)
                 for _round in rounds:
-                    tflib.run(data_fetch_op, feed_dict)
-                    tflib.run(D_train_op, feed_dict)
+                    tflib.run(data_fetch_op, feed_dict_d)
+                    tflib.run(D_train_op, feed_dict_d)
                 if run_D_reg:
                     for _round in rounds:
-                        tflib.run(D_reg_op, feed_dict)
+                        tflib.run(D_reg_op, feed_dict_d)
 
         # Perform maintenance tasks once per tick.
         done = (cur_nimg >= total_kimg * 1000)
@@ -334,7 +347,7 @@ def training_loop(
             # Save snapshots.
             if image_snapshot_ticks is not None and (cur_tick % image_snapshot_ticks == 0 or done):
                 grid_fakes = Gs.run(grid_latents, grid_labels, is_validation=True, minibatch_size=sched.minibatch_gpu)
-                misc.save_image_grid(grid_fakes, dnnlib.make_run_dir_path('fakes%06d.png' % (cur_nimg // 1000)), drange=drange_net, grid_size=grid_size)
+                misc.save_image_grid(grid_fakes, dnnlib.make_run_dir_path('fakes%06d.jpg' % (cur_nimg // 1000)), drange=drange_net, grid_size=grid_size)
             if network_snapshot_ticks is not None and (cur_tick % network_snapshot_ticks == 0 or done):
                 pkl = dnnlib.make_run_dir_path('network-snapshot-%06d.pkl' % (cur_nimg // 1000))
                 misc.save_pkl((G, D, Gs), pkl)

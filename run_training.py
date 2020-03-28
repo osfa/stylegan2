@@ -33,7 +33,7 @@ _valid_configs = [
 
 #----------------------------------------------------------------------------
 
-def run(dataset, data_dir, result_dir, config_id, num_gpus, total_kimg, gamma, mirror_augment, metrics, resume_pkl, resume_kimg, lrate_base):
+def run(dataset, data_dir, result_dir, config_id, num_gpus, total_kimg, gamma, mirror_augment, mirror_augment_v, metrics, min_h, min_w, res_log2, lr, use_attention, resume_with_new_nets, glr, dlr, use_raw, resume_pkl, resume_kimg):
     train     = EasyDict(run_func_name='training.training_loop.training_loop') # Options for training loop.
     G         = EasyDict(func_name='training.networks_stylegan2.G_main')       # Options for generator network.
     D         = EasyDict(func_name='training.networks_stylegan2.D_stylegan2')  # Options for discriminator network.
@@ -49,8 +49,18 @@ def run(dataset, data_dir, result_dir, config_id, num_gpus, total_kimg, gamma, m
     train.data_dir = data_dir
     train.total_kimg = total_kimg
     train.mirror_augment = mirror_augment
-    train.image_snapshot_ticks = train.network_snapshot_ticks = 10
-    sched.G_lrate_base = sched.D_lrate_base = sched.G_lrate_base = sched.D_lrate_base = lrate_base
+
+    train.mirror_augment_v = mirror_augment_v
+    train.resume_with_new_nets = resume_with_new_nets
+    train.image_snapshot_ticks = 1
+    train.network_snapshot_ticks = 4
+    sched.G_lrate_base = sched.D_lrate_base = lr
+    
+    if glr:
+        sched.G_lrate_base = glr
+    if dlr:
+        sched.D_lrate_base = dlr
+
     sched.minibatch_size_base = 32
     sched.minibatch_gpu_base = 4
     D_loss.gamma = 10
@@ -59,6 +69,13 @@ def run(dataset, data_dir, result_dir, config_id, num_gpus, total_kimg, gamma, m
 
     desc += '-' + dataset
     dataset_args = EasyDict(tfrecord_dir=dataset)
+    dataset_args.use_raw = use_raw
+    G.min_h = D.min_h = dataset_args.min_h = min_h
+    G.min_w = D.min_w = dataset_args.min_w = min_w
+    G.res_log2 = D.res_log2 = dataset_args.res_log2 = res_log2
+
+    if use_attention:
+        desc+= '-attention'; G.use_attention=True; D.use_attention=True
 
     assert num_gpus in [1, 2, 4, 8]
     sc.num_gpus = num_gpus
@@ -168,12 +185,22 @@ def main():
     parser.add_argument('--total-kimg', help='Training length in thousands of images (default: %(default)s)', metavar='KIMG', default=25000, type=int)
     parser.add_argument('--gamma', help='R1 regularization weight (default is config dependent)', default=None, type=float)
     parser.add_argument('--mirror-augment', help='Mirror augment (default: %(default)s)', default=False, metavar='BOOL', type=_str_to_bool)
+    parser.add_argument('--mirror-augment-v', help='Mirror augment vertically (default: %(default)s)', default=False, metavar='BOOL', type=_str_to_bool)
     parser.add_argument('--metrics', help='Comma-separated list of metrics or "none" (default: %(default)s)', default='fid50k', type=_parse_comma_sep)
     
     parser.add_argument('--resume-pkl', help='pkl to resume training from: None)', default=None, type=str)
     parser.add_argument('--resume-kimg', help='kimg to resume training from" (default: 0)', default=0, type=int)
-    parser.add_argument('--lrate-base', help='base learning rate for generator and discriminator" (default: 0.002)', default=0.002, type=float)
 
+    parser.add_argument('--min-h', help='lowest dim of height', default=4, type=int)
+    parser.add_argument('--min-w', help='lowest dim of width', default=4, type=int)
+    parser.add_argument('--res-log2', help='multiplier for image size, the training image size (height, width) should be (min_h * 2**res_log2, min_w * 2**res_log2)', default=8, type=int)
+    parser.add_argument('--lr', help='base learning rate', default=0.002, type=float) # vs 0.003?
+    parser.add_argument('--glr',help='overwrite base learning rate for G', default=None, type=float)
+    parser.add_argument('--dlr',help='overwrite base learning rate for D', default=None, type=float)
+    parser.add_argument('--use-raw', help='Use raw image dataset, i.e. created from create_from_images_raw (default: %(default)s)', default=True, metavar='BOOL', type=_str_to_bool)
+    parser.add_argument('--use-attention', help='Experimental: Use google attention (default: %(default)s)', default=False, metavar='BOOL', type=_str_to_bool)
+    parser.add_argument('--resume_with_new_nets', help='Experimental: Copy from checkpoint instead of direct load, useful for network structure modification (default: %(default)s)', default=False, metavar='BOOL', type=_str_to_bool)
+    
     args = parser.parse_args()
 
     if not os.path.exists(args.data_dir):
