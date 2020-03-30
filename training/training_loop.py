@@ -153,6 +153,8 @@ def training_loop(
 
     # Construct or load networks.
     with tf.device('/gpu:0'):
+        print('Loading PKL:', resume_pkl)
+        print(dnnlib.submit_config.run_dir_root)
         if resume_pkl == 'latest':
            resume_pkl, resume_kimg = misc.locate_latest_pkl(dnnlib.submit_config.run_dir_root) 
         if resume_pkl is None or resume_with_new_nets:
@@ -165,6 +167,8 @@ def training_loop(
             rG, rD, rGs = misc.load_pkl(resume_pkl)
             if resume_with_new_nets: G.copy_vars_from(rG); D.copy_vars_from(rD); Gs.copy_vars_from(rGs)
             else: G = rG; D = rD; Gs = rGs
+        
+        print(resume_pkl)
 
     # Print layers and generate initial image snapshot.
     G.print_layers(); D.print_layers()
