@@ -188,7 +188,7 @@ def main():
     parser.add_argument('--mirror-augment-v', help='Mirror augment vertically (default: %(default)s)', default=False, metavar='BOOL', type=_str_to_bool)
     parser.add_argument('--metrics', help='Comma-separated list of metrics or "none" (default: %(default)s)', default='fid50k', type=_parse_comma_sep)
     
-    parser.add_argument('--resume-pkl', help='pkl to resume training from: None)', default=None, type=str)
+    parser.add_argument('--resume-pkl', help='pkl to resume training from: None)', default='latest', type=str)
     parser.add_argument('--resume-kimg', help='kimg to resume training from" (default: 0)', default=0, type=int)
 
     parser.add_argument('--min-h', help='lowest dim of height', default=4, type=int)
